@@ -1,35 +1,57 @@
 // Core domain types for the Watch Later Synthesizer plugin.
 
-export interface Clipping {
-	path: string;
-	title: string;
-	mtime: number; // file last-modified time, for incremental sync
-	url?: string; // frontmatter "source" or "url"
-	author?: string; // frontmatter "author"
-	savedDate?: string; // frontmatter "created" or "date saved"
-	status?: string; // frontmatter "status" (e.g. unread / read)
+/**
+ * One YouTube video from the watch-later pile, parsed from a vault note.
+ * Every metadata field is nullable because clipper/import templates vary and
+ * any field may be absent.
+ */
+export interface VideoRecord {
+	videoId: string;
+	url: string;
+	title: string | null;
+	channel: string | null;
+	published: string | null;
+	duration: string | null;
+	sourceFile: string; // the note path this video came from
+	descriptionText: string | null; // body "## Description" content, if present
 }
 
-export interface ClipExtraction {
-	id: string; // djb2 hash of the clipping path
-	summary: string; // 2-3 sentences, in the article's own language
-	keyClaims: string[]; // in the article's own language
-	topics: string[]; // lowercase
-	language?: string; // ISO 639-1 code of the article
-	readTimeMinutes?: number;
+/**
+ * Per-video triage decision produced by the synthesizer: keep it in the pile
+ * to watch, or skip it.
+ */
+export interface VideoVerdict {
+	videoId: string;
+	verdict: "watch" | "skip";
+	likelyTopic: string;
+	reason: string; // short justification
 }
 
-export interface ThemeSynthesis {
-	consensus: string; // 1-2 sentences: what the sources agree on
-	tension: string; // 1-2 sentences: where they diverge, or "" if none
-	language?: string; // ISO 639-1 of the dominant source language
+/**
+ * Full synthesis output across the whole watch-later pile: a verdict per video,
+ * the themes that recur across the pile, and the videos safe to delete.
+ */
+export interface TriageResult {
+	verdicts: VideoVerdict[];
+	recurringThemes: string[]; // cross-pile recurring themes
+	safeToDelete: string[]; // videoIds safe to remove
 }
 
+/**
+ * Persisted synthesis state. Two incremental layers, both keyed by djb2
+ * signatures so unchanged work is never re-sent to the LLM:
+ *   - `verdicts`: per-video verdict cache keyed by videoId. `signature` hashes
+ *     the verdict-affecting fields (title + channel + duration + published +
+ *     descriptionText); an unchanged signature means reuse, zero LLM cost.
+ *   - `themes`: cross-pile synthesis, reused while `memberSignature` (a hash of
+ *     the sorted videoIds plus their per-video signatures) is unchanged.
+ */
 export interface SynthesisCache {
-	extractions: Record<string, { mtime: number; extraction: ClipExtraction }>;
-	// Per-theme LLM synthesis, keyed by theme (lowercase topic). `signature`
-	// is a hash of the member set + their mtimes, so an unchanged theme is
-	// never re-synthesized (zero tokens on re-sync).
-	themeSyntheses: Record<string, { signature: string; synthesis: ThemeSynthesis }>;
+	verdicts: Record<string, { signature: string; verdict: VideoVerdict }>;
+	themes: {
+		memberSignature: string;
+		recurringThemes: string[];
+		safeToDelete: string[];
+	};
 	lastSynced: string;
 }

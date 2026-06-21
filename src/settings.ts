@@ -4,20 +4,18 @@ import { verifyLicense } from "./license";
 
 export type LLMProvider = "anthropic" | "openai-compatible";
 
-/** Floor for the stale-clipping threshold; flagging anything younger than a
- * week would just be noise. Mirrored defensively in the report engine. */
-export const STALE_DAYS_MIN = 7;
-
 export interface WatchLaterSettings {
 	provider: LLMProvider;
 	apiKey: string;
 	baseUrl: string;
 	model: string;
+	// These two keys are the watch-later video source (folder OR tag). The
+	// clippings* identifiers are retained as internal setting keys; renaming
+	// them is deferred to avoid breaking saved user settings on disk.
 	clippingsFolder: string;
 	clippingsTag: string;
-	staleDays: number;
 	proLicenseKey: string;
-	// Lifetime free-tier usage. A "use" is one successful sync; there is no
+	// Lifetime free-tier usage. A "use" is one successful run; there is no
 	// monthly reset, so the count only ever grows until a Pro license unlocks it.
 	freeUsage: { count: number };
 }
@@ -27,9 +25,8 @@ export const DEFAULT_SETTINGS: WatchLaterSettings = {
 	apiKey: "",
 	baseUrl: "https://api.anthropic.com",
 	model: "claude-sonnet-4-6",
-	clippingsFolder: "Clippings",
-	clippingsTag: "clipping",
-	staleDays: 90,
+	clippingsFolder: "Watch Later",
+	clippingsTag: "watch-later",
 	proLicenseKey: "",
 	freeUsage: { count: 0 },
 };
@@ -46,8 +43,39 @@ export class WatchLaterSettingTab extends PluginSettingTab {
 		const { containerEl } = this;
 		containerEl.empty();
 
-		// --- Language model section ---
-		new Setting(containerEl).setName("Language model").setHeading();
+		// --- Source section ---
+		new Setting(containerEl).setName("Source").setHeading();
+
+		new Setting(containerEl)
+			.setName("Videos folder")
+			.setDesc(
+				"Vault-relative folder whose notes are treated as watch-later videos."
+			)
+			.addText((text) => {
+				text
+					.setPlaceholder("Watch Later")
+					.setValue(this.plugin.settings.clippingsFolder)
+					.onChange(async (value) => {
+						this.plugin.settings.clippingsFolder = value.trim();
+						await this.plugin.saveSettings();
+					});
+			});
+
+		new Setting(containerEl)
+			.setName("Videos tag")
+			.setDesc("Any note carrying this tag also counts as a watch-later video.")
+			.addText((text) => {
+				text
+					.setPlaceholder("watch-later")
+					.setValue(this.plugin.settings.clippingsTag)
+					.onChange(async (value) => {
+						this.plugin.settings.clippingsTag = value.trim();
+						await this.plugin.saveSettings();
+					});
+			});
+
+		// --- AI synthesis section ---
+		new Setting(containerEl).setName("AI synthesis").setHeading();
 
 		new Setting(containerEl)
 			.setName("Provider")
@@ -59,20 +87,6 @@ export class WatchLaterSettingTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.provider)
 					.onChange(async (value) => {
 						this.plugin.settings.provider = value as LLMProvider;
-						await this.plugin.saveSettings();
-					});
-			});
-
-		new Setting(containerEl)
-			.setName("API key")
-			.setDesc("Stored locally in this vault. Never committed or shared.")
-			.addText((text) => {
-				text.inputEl.type = "password";
-				text
-					.setPlaceholder("sk-...")
-					.setValue(this.plugin.settings.apiKey)
-					.onChange(async (value) => {
-						this.plugin.settings.apiKey = value.trim();
 						await this.plugin.saveSettings();
 					});
 			});
@@ -103,50 +117,16 @@ export class WatchLaterSettingTab extends PluginSettingTab {
 					});
 			});
 
-		// --- Clipping detection section ---
-		new Setting(containerEl).setName("Clipping detection").setHeading();
-
 		new Setting(containerEl)
-			.setName("Clippings folder")
-			.setDesc("Vault-relative folder whose notes are treated as clippings.")
+			.setName("API key")
+			.setDesc("Stored locally in this vault. Never committed or shared.")
 			.addText((text) => {
+				text.inputEl.type = "password";
 				text
-					.setPlaceholder("Clippings")
-					.setValue(this.plugin.settings.clippingsFolder)
+					.setPlaceholder("sk-...")
+					.setValue(this.plugin.settings.apiKey)
 					.onChange(async (value) => {
-						this.plugin.settings.clippingsFolder = value.trim();
-						await this.plugin.saveSettings();
-					});
-			});
-
-		new Setting(containerEl)
-			.setName("Clippings tag")
-			.setDesc("Any note carrying this tag also counts as a clipping.")
-			.addText((text) => {
-				text
-					.setPlaceholder("clipping")
-					.setValue(this.plugin.settings.clippingsTag)
-					.onChange(async (value) => {
-						this.plugin.settings.clippingsTag = value.trim();
-						await this.plugin.saveSettings();
-					});
-			});
-
-		new Setting(containerEl)
-			.setName("Stale after (days)")
-			.setDesc(
-				`Clippings saved this many days ago are flagged "Needs attention" in the report. Minimum ${STALE_DAYS_MIN}.`
-			)
-			.addText((text) => {
-				text.inputEl.type = "number";
-				text
-					.setPlaceholder("90")
-					.setValue(String(this.plugin.settings.staleDays))
-					.onChange(async (value) => {
-						const parsed = Number.parseInt(value, 10);
-						this.plugin.settings.staleDays = Number.isFinite(parsed)
-							? Math.max(STALE_DAYS_MIN, parsed)
-							: DEFAULT_SETTINGS.staleDays;
+						this.plugin.settings.apiKey = value.trim();
 						await this.plugin.saveSettings();
 					});
 			});
@@ -160,7 +140,7 @@ export class WatchLaterSettingTab extends PluginSettingTab {
 			.addText((text) => {
 				text.inputEl.type = "password";
 				text
-					.setPlaceholder("RIS-...")
+					.setPlaceholder("WLS-...")
 					.setValue(this.plugin.settings.proLicenseKey)
 					.onChange(async (value) => {
 						this.plugin.settings.proLicenseKey = value.trim();
@@ -179,7 +159,7 @@ export class WatchLaterSettingTab extends PluginSettingTab {
 				.setDesc(status.reason ?? "Could not verify license key.");
 		} else {
 			new Setting(containerEl).setDesc(
-				`Free tier — 3 total syncs (${this.plugin.settings.freeUsage.count}/3 used)`
+				`Free tier — 3 total runs (${this.plugin.settings.freeUsage.count}/3 used)`
 			);
 		}
 	}

@@ -4,14 +4,20 @@ import {
 	WatchLaterSettingTab,
 	type WatchLaterSettings,
 } from "./settings";
-import { LLMAdapter, MAX_INPUT_CHARS } from "./llm";
-import { ClippingCollector } from "./collector";
-import { SynthesisEngine, type ClippingInput } from "./synthesizer";
+import { LLMAdapter } from "./llm";
+import { VideoCollector } from "./collector";
+import { SynthesisEngine } from "./synthesizer";
 import { verifyLicense } from "./license";
-import type { Clipping, SynthesisCache } from "./types";
+import type { SynthesisCache, VideoRecord } from "./types";
+
+const REPORT_PATH = "Watch Later Triage.md";
 
 function emptyCache(): SynthesisCache {
-	return { extractions: {}, themeSyntheses: {}, lastSynced: "" };
+	return {
+		verdicts: {},
+		themes: { memberSignature: "", recurringThemes: [], safeToDelete: [] },
+		lastSynced: "",
+	};
 }
 
 /**
@@ -28,7 +34,7 @@ export default class WatchLaterSynthesizerPlugin extends Plugin {
 	cache: SynthesisCache = emptyCache();
 
 	llm!: LLMAdapter;
-	collector!: ClippingCollector;
+	collector!: VideoCollector;
 	engine!: SynthesisEngine;
 
 	override async onload(): Promise<void> {
@@ -37,28 +43,28 @@ export default class WatchLaterSynthesizerPlugin extends Plugin {
 		await this.loadSettings();
 
 		this.llm = new LLMAdapter(this.settings);
-		this.collector = new ClippingCollector(this.app, this.settings);
+		this.collector = new VideoCollector(this.app, this.settings);
 		this.engine = new SynthesisEngine(this.llm, this.cache);
 
 		this.addSettingTab(new WatchLaterSettingTab(this.app, this));
 
 		this.addCommand({
-			id: "sync-clippings",
-			name: "Sync clippings",
+			id: "sync-videos",
+			name: "Sync videos",
 			callback: () => {
 				void this.runSync();
 			},
 		});
 
 		this.addCommand({
-			id: "generate-report",
-			name: "Generate report",
+			id: "generate-triage-report",
+			name: "Generate triage report",
 			callback: () => {
 				void this.runGenerateReport();
 			},
 		});
 
-		this.addRibbonIcon("book-open", "Generate report", () => {
+		this.addRibbonIcon("list-video", "Generate triage report", () => {
 			void this.runGenerateReport();
 		});
 	}
@@ -94,135 +100,177 @@ export default class WatchLaterSynthesizerPlugin extends Plugin {
 	}
 
 	/**
-	 * Sync the reading inbox: collect clippings, prepare bodies for the
-	 * new/changed ones, hand them to the pure engine, persist the cache.
-	 * All vault I/O happens here — the engine never touches files.
+	 * Sync the watch-later pile: collect videos, hand them to the pure engine for
+	 * triage, persist the cache. All vault and network I/O is owned here (the
+	 * collector reads notes + oEmbed; the engine reaches the LLM only through the
+	 * injected adapter) — the engine never touches files or settings.
 	 */
 	private async runSync(): Promise<void> {
-		// Pro gate. Lifetime free tier: 3 successful syncs, no monthly reset.
+		// Pro gate. Lifetime free tier: 3 successful runs, no monthly reset.
 		// Pro users are never counted or blocked. Bail before any LLM call.
 		const isPro = verifyLicense(this.settings.proLicenseKey).valid;
 		if (!isPro && this.settings.freeUsage.count >= 3) {
 			new Notice(
-				"Free limit reached: 3 total syncs. Upgrade to Pro for unlimited."
+				"Free limit reached: 3 total runs. Upgrade to Pro for unlimited."
 			);
 			return;
 		}
 
 		try {
-			const clippings = this.collector.collect();
+			const videos = await this.collector.collect();
+			const { result, stats } = await this.engine.triage(videos);
 
-			const inputs: ClippingInput[] = [];
-			for (const clipping of clippings) {
-				if (!this.engine.needsExtraction(clipping)) {
-					continue;
-				}
-				const body = await this.readBody(clipping);
-				if (body === null) {
-					continue;
-				}
-				inputs.push({ clipping, body });
-			}
-
-			const result = await this.engine.syncClippings(
-				clippings,
-				inputs,
-				this.todayISO()
-			);
+			this.cache.lastSynced = this.todayISO();
 			await this.persist();
 
-			// Count the use only after a fully successful sync. One sync = one
-			// use, regardless of how many clippings it touched.
+			// Count the use only after a fully successful run. One run = one use,
+			// regardless of how many videos it touched.
 			if (!isPro) {
 				this.settings.freeUsage.count += 1;
 				await this.persist();
 			}
 
+			const watch = result.verdicts.filter(
+				(v) => v.verdict === "watch"
+			).length;
+			const skip = result.verdicts.filter((v) => v.verdict === "skip").length;
 			new Notice(
-				`Synced ${result.extracted} clippings, ${result.themes} themes ` +
-					`(${result.themesResynthesized} re-synthesized, ` +
-					`${result.skipped} skipped, ${result.failed} failed).`
+				`Triaged ${stats.total} videos: ${watch} watch, ${skip} skip ` +
+					`(${stats.computed} new, ${stats.reused} cached, ${stats.failed} failed).`
 			);
 		} catch (error) {
-			console.error("Watch Later Synthesizer: sync failed", error);
-			new Notice("Sync failed. See console for details.");
+			console.error("Watch Later Synthesizer: triage failed", error);
+			new Notice("Triage failed. See console for details.");
 		}
 	}
 
 	/**
-	 * Render the report from the current cache and write it to a fixed vault
-	 * note, overwriting if it exists, then open it. Zero LLM calls — always
-	 * free; collecting clippings only reads vault metadata.
+	 * Render the triage report from the current cache and write it to a fixed
+	 * vault note, overwriting if it exists, then open it. Zero LLM calls — always
+	 * free; collecting videos reads note metadata and may call oEmbed only.
 	 */
 	private async runGenerateReport(): Promise<void> {
-		const path = "Reading Synthesis.md";
 		try {
-			const clippings = this.collector.collect();
-			const markdown = this.engine.buildReportMarkdown(
-				clippings,
-				this.todayISO(),
-				this.settings.staleDays
-			);
+			const videos = await this.collector.collect();
+			const markdown = this.buildReportMarkdown(videos);
 
-			const existing = this.app.vault.getAbstractFileByPath(path);
+			const existing = this.app.vault.getAbstractFileByPath(REPORT_PATH);
 			let file: TFile;
 			if (existing instanceof TFile) {
 				await this.app.vault.modify(existing, markdown);
 				file = existing;
 			} else {
-				file = await this.app.vault.create(path, markdown);
+				file = await this.app.vault.create(REPORT_PATH, markdown);
 			}
 
 			await this.app.workspace.getLeaf(false).openFile(file);
-			new Notice("Reading report updated.");
+			new Notice("Triage report updated.");
 		} catch (error) {
 			console.error(
-				"Watch Later Synthesizer: failed to write reading report",
+				"Watch Later Synthesizer: failed to write triage report",
 				error
 			);
-			new Notice("Failed to write reading report. See console.");
+			new Notice("Failed to write triage report. See console.");
 		}
 	}
 
 	/**
-	 * Read a clipping's article body: frontmatter stripped, markdown noise
-	 * cleaned, then truncated to MAX_INPUT_CHARS so long articles fit
-	 * small-context models. Returns null when the path no longer resolves to
-	 * a file (vanished mid-sync).
+	 * Format the triage report markdown from the collected videos and the cached
+	 * verdicts/themes. Pure string assembly — all formatting lives here, not in
+	 * the engine. Videos with no cached verdict are listed under "Not triaged
+	 * yet" so the report never silently drops them.
 	 */
-	private async readBody(clipping: Clipping): Promise<string | null> {
-		const file = this.app.vault.getAbstractFileByPath(clipping.path);
-		if (!(file instanceof TFile)) {
-			return null;
+	private buildReportMarkdown(videos: VideoRecord[]): string {
+		const lines: string[] = [];
+		const byId = new Map(videos.map((v) => [v.videoId, v]));
+		const verdictOf = (videoId: string) =>
+			this.cache.verdicts[videoId]?.verdict;
+
+		lines.push("# Watch Later Triage");
+		lines.push("");
+		lines.push(`_Last synced: ${this.cache.lastSynced || "never"}_`);
+		lines.push("");
+
+		const watch = videos.filter(
+			(v) => verdictOf(v.videoId)?.verdict === "watch"
+		);
+		const skip = videos.filter((v) => verdictOf(v.videoId)?.verdict === "skip");
+		const untriaged = videos.filter((v) => verdictOf(v.videoId) === undefined);
+
+		// --- Watch ---
+		lines.push(`## Watch (${watch.length})`);
+		if (watch.length === 0) {
+			lines.push("_Nothing to watch._");
+		} else {
+			for (const video of watch) {
+				lines.push(this.videoLine(video));
+			}
 		}
-		const raw = await this.app.vault.cachedRead(file);
-		const stripped = raw.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "");
-		return this.cleanBody(stripped).slice(0, MAX_INPUT_CHARS);
+		lines.push("");
+
+		// --- Skip ---
+		lines.push(`## Skip (${skip.length})`);
+		if (skip.length === 0) {
+			lines.push("_Nothing to skip._");
+		} else {
+			for (const video of skip) {
+				lines.push(this.videoLine(video));
+			}
+		}
+		lines.push("");
+
+		// --- Recurring themes ---
+		lines.push("## Recurring themes");
+		const themes = this.cache.themes.recurringThemes;
+		if (themes.length === 0) {
+			lines.push("_No themes recur across the pile yet._");
+		} else {
+			for (const theme of themes) {
+				lines.push(`- ${theme}`);
+			}
+		}
+		lines.push("");
+
+		// --- Safe to delete ---
+		lines.push("## Safe to delete");
+		const safe = this.cache.themes.safeToDelete;
+		if (safe.length === 0) {
+			lines.push("_Nothing flagged safe to delete._");
+		} else {
+			for (const id of safe) {
+				const video = byId.get(id);
+				lines.push(
+					video ? `- [${this.titleOf(video)}](${video.url})` : `- ${id}`
+				);
+			}
+		}
+		lines.push("");
+
+		// --- Not triaged yet ---
+		if (untriaged.length > 0) {
+			lines.push(`## Not triaged yet (${untriaged.length})`);
+			lines.push('_Run "Sync videos" to triage these._');
+			for (const video of untriaged) {
+				lines.push(`- [${this.titleOf(video)}](${video.url})`);
+			}
+			lines.push("");
+		}
+
+		return lines.join("\n");
 	}
 
-	/**
-	 * Strip markdown noise so the truncation window lands on real prose, not
-	 * navigation boilerplate: link-heavy pages otherwise fill the first 24k
-	 * chars with URLs and the model sees no article text at all.
-	 */
-	private cleanBody(text: string): string {
-		// Image embeds carry no prose — drop them entirely.
-		let cleaned = text.replace(/!\[[^\]]*\]\([^)]*\)/g, "");
-		// Markdown links: keep the visible text, drop the URL.
-		cleaned = cleaned.replace(/\[([^\]]*)\]\(([^)]*)\)/g, "$1");
-		// Bare URLs are pure token waste.
-		cleaned = cleaned.replace(/https?:\/\/\S+/g, "");
+	/** One report bullet for a video: title link, channel, topic, and reason. */
+	private videoLine(video: VideoRecord): string {
+		const verdict = this.cache.verdicts[video.videoId]?.verdict;
+		const channel = video.channel ? ` — ${video.channel}` : "";
+		const topic = verdict?.likelyTopic ? ` — _${verdict.likelyTopic}_` : "";
+		const reason = verdict?.reason ? ` — ${verdict.reason}` : "";
+		return `- [${this.titleOf(video)}](${video.url})${channel}${topic}${reason}`;
+	}
 
-		// Blank out lines left with no letters or digits (list markers,
-		// brackets, punctuation), then collapse the resulting gaps so
-		// paragraph structure survives but boilerplate runs don't.
-		cleaned = cleaned
-			.split("\n")
-			.map((line) => (/[\p{L}\p{N}]/u.test(line) ? line : ""))
-			.join("\n")
-			.replace(/\n{3,}/g, "\n\n");
-
-		return cleaned.trim();
+	/** A video's display title, falling back to its id when unknown. */
+	private titleOf(video: VideoRecord): string {
+		return video.title ?? video.videoId;
 	}
 
 	/**

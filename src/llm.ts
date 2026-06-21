@@ -23,8 +23,8 @@ interface OpenAIResponse {
 const MAX_TOKENS = 4096;
 
 /**
- * Cap on how many characters of an article body the caller should send per
- * request. Clippings can be very long, and small-context models (e.g. free
+ * Cap on how many characters of video metadata the caller should send per
+ * request. Descriptions can be long, and small-context models (e.g. free
  * OpenRouter tiers) reject oversized prompts — truncate before calling
  * {@link LLMAdapter.complete}.
  */
@@ -32,7 +32,7 @@ export const MAX_INPUT_CHARS = 24000;
 
 /**
  * Thin adapter over the configured chat provider. Knows nothing about
- * clippings — it just turns a (system, user) prompt pair into a string.
+ * videos — it just turns a (system, user) prompt pair into a string.
  */
 export class LLMAdapter {
 	private readonly settings: WatchLaterSettings;
