@@ -1,0 +1,11 @@
+{
+  "id": "watch-later-synthesizer",
+  "name": "Watch Later Synthesizer",
+  "version": "1.0.0",
+  "minAppVersion": "1.5.0",
+  "description": "Triage your YouTube Watch Later backlog: per-video watch-or-skip verdicts, recurring themes across the pile, and a safe-to-delete list.",
+  "author": "ibrh96-prog",
+  "authorUrl": "https://ibrh96.gumroad.com",
+  "fundingUrl": "https://ibrh96.gumroad.com",
+  "isDesktopOnly": false
+}

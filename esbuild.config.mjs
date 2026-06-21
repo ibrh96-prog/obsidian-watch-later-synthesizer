@@ -1,0 +1,57 @@
+import esbuild from "esbuild";
+import { copyFileSync } from "fs";
+
+const prod = process.argv[2] === "production";
+
+const builtins = [
+  "assert", "buffer", "child_process", "cluster", "console", "constants",
+  "crypto", "dgram", "dns", "domain", "events", "fs", "http", "https",
+  "module", "net", "os", "path", "punycode", "querystring", "readline",
+  "repl", "stream", "string_decoder", "sys", "timers", "tls", "tty",
+  "url", "util", "vm", "zlib", "perf_hooks", "worker_threads",
+];
+
+const context = await esbuild.context({
+  banner: { js: "/* Watch Later Synthesizer — Obsidian Plugin */" },
+  entryPoints: ["src/main.ts"],
+  bundle: true,
+  external: [
+    "obsidian",
+    "electron",
+    "@codemirror/autocomplete",
+    "@codemirror/closebrackets",
+    "@codemirror/commands",
+    "@codemirror/fold",
+    "@codemirror/gutter",
+    "@codemirror/highlight",
+    "@codemirror/history",
+    "@codemirror/language",
+    "@codemirror/lint",
+    "@codemirror/matchbrackets",
+    "@codemirror/panel",
+    "@codemirror/rangeset",
+    "@codemirror/rectangular-selection",
+    "@codemirror/search",
+    "@codemirror/state",
+    "@codemirror/stream-parser",
+    "@codemirror/text",
+    "@codemirror/tooltip",
+    "@codemirror/view",
+    ...builtins,
+  ],
+  format: "cjs",
+  target: "es2022",
+  logLevel: "info",
+  sourcemap: prod ? false : "inline",
+  treeShaking: true,
+  outfile: "main.js",
+});
+
+if (prod) {
+  await context.rebuild();
+  context.dispose();
+  copyFileSync("src/styles.css", "styles.css");
+} else {
+  copyFileSync("src/styles.css", "styles.css");
+  await context.watch();
+}

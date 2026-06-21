@@ -1,0 +1,28 @@
+{
+  "name": "obsidian-watch-later-synthesizer",
+  "version": "1.0.0",
+  "description": "Turn your web clippings backlog into reading memory: batch summaries, cross-article themes, and weekly digests.",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "node esbuild.config.mjs production",
+    "version": "node version-bump.mjs && git add manifest.json versions.json",
+    "mint": "node tools/mint-license.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ibrh96-prog/obsidian-watch-later-synthesizer.git"
+  },
+  "keywords": [],
+  "author": "ibrh96-prog",
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.25.0",
+    "obsidian": "latest",
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "tweetnacl": "^1.0.3"
+  }
+}
