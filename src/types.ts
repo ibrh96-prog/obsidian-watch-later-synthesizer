@@ -25,6 +25,15 @@ export interface VideoVerdict {
 	verdict: "watch" | "skip";
 	likelyTopic: string;
 	reason: string; // short justification
+	// Model output: does the video's value depend on WHEN it was made? The model
+	// classifies content type only — it does no date math.
+	timeSensitivity: "time-sensitive" | "evergreen";
+	// Engine-computed, NOT cached as authoritative: recomputed each render from
+	// timeSensitivity + published + today, so a video correctly becomes stale as
+	// time passes without re-calling the LLM. `stale` is true only for
+	// time-sensitive content older than the staleness threshold.
+	stale: boolean;
+	stalenessReason: string; // engine-written; "" unless stale
 }
 
 /**

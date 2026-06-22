@@ -20,6 +20,7 @@ interface RawVerdict {
 	verdict: "watch" | "skip";
 	likelyTopic: string;
 	reason: string;
+	timeSensitivity: "time-sensitive" | "evergreen";
 }
 
 interface RawPile {
@@ -47,23 +48,41 @@ type ParseOutcome<T> =
  */
 const MAX_DESCRIPTION_CHARS = 8000;
 
+/**
+ * A time-sensitive video is considered stale once it is older than this many
+ * days. Engine-side only — the model never sees or reasons about dates.
+ */
+const STALE_AFTER_DAYS = 90;
+
 const VERDICT_SYSTEM_PROMPT = [
 	"You are a YouTube watch-later triage engine. You are given the available",
-	"metadata for ONE saved video — title, channel, duration, published date, and",
-	"(when present) its description. Decide whether it is worth the user's time to",
-	"watch, or whether they can skip it.",
+	"metadata for ONE saved video — title, channel, duration, and (when present)",
+	"its description. Decide whether it is worth the user's time to watch, or",
+	"whether they can skip it.",
 	"",
 	"Base your decision ONLY on the metadata provided. Do NOT invent facts about",
 	"the video's content. When the metadata is thin (for example no title, no",
 	"channel, or no description), say so plainly in the reason and treat your",
 	"confidence as LOW — do NOT fabricate a confident verdict from nothing.",
 	"",
+	"CONTENT TYPE — classify whether the video's value depends on WHEN it was",
+	"made. This is a classification of the kind of content ONLY:",
+	'- "time-sensitive": value depends on when it was made — live streams,',
+	'  breaking or daily news, "today\'s"/"this week\'s" coverage, dated event',
+	"  coverage, time-bound market/sports updates.",
+	'- "evergreen": value does NOT decay with time — tutorials, courses, concept',
+	"  explainers, documentaries, how-to guides, reviews of stable topics.",
+	"Do NOT reason about dates or how old the video is. Do NOT decide whether the",
+	'video is "expired", "stale", or "old" — that is computed elsewhere. Just',
+	"classify the content type. When unsure, choose \"evergreen\".",
+	"",
 	"Return ONLY a valid JSON object — no markdown code fences, no commentary,",
 	"no prose before or after. The object must match exactly this shape:",
 	"{",
 	'  "verdict": "watch" | "skip",',
 	'  "likelyTopic": string,',
-	'  "reason": string',
+	'  "reason": string,',
+	'  "timeSensitivity": "time-sensitive" | "evergreen"',
 	"}",
 	"",
 	"Rules:",
@@ -72,6 +91,8 @@ const VERDICT_SYSTEM_PROMPT = [
 	'  the metadata; use "unknown" when there is not enough signal.',
 	'- "reason" is ONE short sentence justifying the verdict. If the metadata is',
 	"  thin, the reason MUST state that confidence is low.",
+	'- "timeSensitivity" is exactly "time-sensitive" or "evergreen". Do NOT',
+	"  mention dates or expiry in any field.",
 	"- Do NOT return a summary of the video — this is a triage verdict, not a",
 	"  summary.",
 ].join("\n");
@@ -138,7 +159,8 @@ export class SynthesisEngine {
 	 * never aborts the run. The cache is mutated in place; the caller persists it.
 	 */
 	async triage(
-		videos: VideoRecord[]
+		videos: VideoRecord[],
+		todayISO: string
 	): Promise<{ result: TriageResult; stats: TriageRunStats }> {
 		const stats: TriageRunStats = {
 			total: videos.length,
@@ -149,26 +171,38 @@ export class SynthesisEngine {
 
 		const verdicts: VideoVerdict[] = [];
 		for (const video of videos) {
-			const signature = this.videoSignature(video);
+			const signature = this.contentSignature(video);
 			const cached = this.cache.verdicts[video.videoId];
+
+			// `modelVerdict` holds the cached/fresh MODEL output only; its stale/
+			// stalenessReason are placeholders and are recomputed below.
+			let modelVerdict: VideoVerdict;
 			if (cached && cached.signature === signature) {
-				verdicts.push(cached.verdict);
+				modelVerdict = cached.verdict;
 				stats.reused += 1;
-				continue;
+			} else {
+				const fresh = await this.verdictFor(video);
+				if (!fresh) {
+					// Parse failed both attempts — skip, leaving any stale cache entry
+					// so the next run retries it.
+					stats.failed += 1;
+					continue;
+				}
+				this.cache.verdicts[video.videoId] = { signature, verdict: fresh };
+				modelVerdict = fresh;
+				stats.computed += 1;
+				console.log(`[Watch Later Synthesizer] Triaged: ${video.videoId}`);
 			}
 
-			const verdict = await this.verdictFor(video);
-			if (!verdict) {
-				// Parse failed both attempts — skip, leaving any stale cache entry
-				// so the next run retries it.
-				stats.failed += 1;
-				continue;
-			}
-
-			this.cache.verdicts[video.videoId] = { signature, verdict };
-			verdicts.push(verdict);
-			stats.computed += 1;
-			console.log(`[Watch Later Synthesizer] Triaged: ${video.videoId}`);
+			// Engine computes staleness fresh from today's date — never trusted
+			// from cache, so a video becomes stale as time passes without an LLM
+			// call. The cache keeps the model output (stale=false placeholder).
+			const { stale, stalenessReason } = this.computeStaleness(
+				modelVerdict.timeSensitivity,
+				video.published,
+				todayISO
+			);
+			verdicts.push({ ...modelVerdict, stale, stalenessReason });
 		}
 
 		// Drop cached verdicts for videos no longer in the pile.
@@ -220,7 +254,7 @@ export class SynthesisEngine {
 	 * to "" and a NUL separator keeps "a"+"bc" distinct from "ab"+"c". Identical
 	 * signature ⇒ same inputs ⇒ no need to re-call the LLM.
 	 */
-	private videoSignature(video: VideoRecord): string {
+	private contentSignature(video: VideoRecord): string {
 		const parts = [
 			video.title,
 			video.channel,
@@ -242,9 +276,84 @@ export class SynthesisEngine {
 			return "";
 		}
 		const parts = videos
-			.map((v) => `${v.videoId}:${this.videoSignature(v)}`)
+			.map((v) => `${v.videoId}:${this.contentSignature(v)}`)
 			.sort();
 		return this.hash(parts.join("|"));
+	}
+
+	// --- Engine-computed staleness ---
+
+	/**
+	 * Compute whether a video is stale, from the model's content-type
+	 * classification, the video's published date, and today. Pure date math — no
+	 * `new Date()`; `todayISO` is supplied by the caller. Only time-sensitive
+	 * content older than {@link STALE_AFTER_DAYS} is stale; evergreen content is
+	 * never stale regardless of age, and an unparseable published date is never
+	 * stale (we do not guess). Used both when building triage results and when
+	 * rendering the report, so staleness stays correct as days pass with no LLM.
+	 */
+	computeStaleness(
+		timeSensitivity: VideoVerdict["timeSensitivity"],
+		published: string | null,
+		todayISO: string
+	): { stale: boolean; stalenessReason: string } {
+		if (timeSensitivity !== "time-sensitive") {
+			return { stale: false, stalenessReason: "" };
+		}
+
+		const publishedDate = this.parseDateLoose(published);
+		const today = this.parseDateLoose(todayISO);
+		if (!publishedDate || !today) {
+			return { stale: false, stalenessReason: "" };
+		}
+
+		const ageDays = Math.floor(
+			(today.getTime() - publishedDate.getTime()) / 86_400_000
+		);
+		if (ageDays <= STALE_AFTER_DAYS) {
+			return { stale: false, stalenessReason: "" };
+		}
+
+		const display = (published ?? "").trim();
+		return {
+			stale: true,
+			stalenessReason: `Time-sensitive content from ${display}; its timely value has likely expired.`,
+		};
+	}
+
+	/**
+	 * Defensive date parser. Accepts a leading ISO date (YYYY-MM-DD, optionally
+	 * with a time suffix), or YYYY-MM (first of the month), or bare YYYY (Jan 1).
+	 * Built in UTC so timezone never shifts the day. Returns null for anything
+	 * unrecognized or out of range — callers treat null as "not stale".
+	 */
+	private parseDateLoose(value: string | null): Date | null {
+		if (typeof value !== "string") {
+			return null;
+		}
+		const v = value.trim();
+
+		const full = v.match(/^(\d{4})-(\d{2})-(\d{2})/);
+		if (full) {
+			return this.utcDate(+full[1], +full[2], +full[3]);
+		}
+		const month = v.match(/^(\d{4})-(\d{2})$/);
+		if (month) {
+			return this.utcDate(+month[1], +month[2], 1);
+		}
+		const year = v.match(/^(\d{4})$/);
+		if (year) {
+			return this.utcDate(+year[1], 1, 1);
+		}
+		return null;
+	}
+
+	/** Build a UTC Date, or null when the month/day are out of range. */
+	private utcDate(year: number, month: number, day: number): Date | null {
+		if (month < 1 || month > 12 || day < 1 || day > 31) {
+			return null;
+		}
+		return new Date(Date.UTC(year, month - 1, day));
 	}
 
 	// --- Per-video verdict ---
@@ -314,12 +423,20 @@ export class SynthesisEngine {
 	}
 
 	/** Stamp the trusted videoId onto a validated LLM verdict. */
+	/**
+	 * Build the cacheable verdict from the validated model output. staleness is
+	 * left as a placeholder (stale=false, "") — it is computed by the engine from
+	 * the date at use time, never stored authoritatively.
+	 */
 	private toVerdict(video: VideoRecord, raw: RawVerdict): VideoVerdict {
 		return {
 			videoId: video.videoId,
 			verdict: raw.verdict,
 			likelyTopic: raw.likelyTopic,
 			reason: raw.reason,
+			timeSensitivity: raw.timeSensitivity,
+			stale: false,
+			stalenessReason: "",
 		};
 	}
 
@@ -363,10 +480,20 @@ export class SynthesisEngine {
 				? obj["likelyTopic"].trim().toLowerCase()
 				: "";
 
+		// Content-type classification. A missing/invalid value defaults to
+		// "evergreen" — the safe default that never wrongly flags a video stale.
+		const timeRaw =
+			typeof obj["timeSensitivity"] === "string"
+				? obj["timeSensitivity"].trim().toLowerCase()
+				: "";
+		const timeSensitivity =
+			timeRaw === "time-sensitive" ? "time-sensitive" : "evergreen";
+
 		return {
 			verdict,
 			likelyTopic: likelyTopic === "" ? "unknown" : likelyTopic,
 			reason,
+			timeSensitivity,
 		};
 	}
 

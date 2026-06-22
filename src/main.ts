@@ -117,10 +117,11 @@ export default class WatchLaterSynthesizerPlugin extends Plugin {
 		}
 
 		try {
+			const today = this.todayISO();
 			const videos = await this.collector.collect();
-			const { result, stats } = await this.engine.triage(videos);
+			const { result, stats } = await this.engine.triage(videos, today);
 
-			this.cache.lastSynced = this.todayISO();
+			this.cache.lastSynced = today;
 			await this.persist();
 
 			// Count the use only after a fully successful run. One run = one use,
@@ -227,6 +228,34 @@ export default class WatchLaterSynthesizerPlugin extends Plugin {
 		} else {
 			for (const theme of themes) {
 				lines.push(`- ${theme}`);
+			}
+		}
+		lines.push("");
+
+		// --- Stale / expired (advisory cross-cut; a stale video still appears in
+		// Watch or Skip above per its verdict). Staleness is recomputed here from
+		// today's date so it stays correct as time passes, with no LLM call. ---
+		lines.push("## Stale / expired");
+		const today = this.todayISO();
+		const staleEntries = videos.flatMap((video) => {
+			const verdict = verdictOf(video.videoId);
+			if (!verdict) {
+				return [];
+			}
+			const { stale, stalenessReason } = this.engine.computeStaleness(
+				verdict.timeSensitivity,
+				video.published,
+				today
+			);
+			return stale ? [{ video, stalenessReason }] : [];
+		});
+		if (staleEntries.length === 0) {
+			lines.push("_Nothing looks expired._");
+		} else {
+			for (const { video, stalenessReason } of staleEntries) {
+				const channel = video.channel ? ` — ${video.channel}` : "";
+				const reason = stalenessReason ? ` — ${stalenessReason}` : "";
+				lines.push(`- [${this.titleOf(video)}](${video.url})${channel}${reason}`);
 			}
 		}
 		lines.push("");
