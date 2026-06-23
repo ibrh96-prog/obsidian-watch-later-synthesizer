@@ -26,7 +26,7 @@ The developer is not a party to your relationship with any provider and is not r
 
 ## 4. Privacy and data
 
-The Software runs entirely on your device. It has no server, no database, and no telemetry. Your clippings and API key remain on your machine. The Software transmits clipping content only to the language model provider you configure, using your own key, for the purpose of generating synthesis output. The developer does not receive, store, or have access to your clippings, API key, or any usage data.
+The Software runs entirely on your device. It has no server, no database, and no telemetry. Your video metadata and API key remain on your machine. The Software transmits video metadata only to the language model provider you configure, using your own key, for the purpose of generating triage output. The developer does not receive, store, or have access to your watch-later notes, API key, or any usage data.
 
 ## 5. Disclaimer of warranty
 
