@@ -50,7 +50,7 @@ Triage quality — especially the watch-vs-skip distinction — depends heavily 
 | Triage report | Unlimited | Unlimited |
 | All AI providers | ✅ | ✅ |
 
-The free tier allows 3 total video syncs (a one-time allowance, not a monthly reset). Generating the triage report from already-synced videos is always free. Pro unlocks unlimited syncing. A license will be available on Gumroad shortly after launch.
+The free tier allows 3 total video syncs (a one-time allowance, not a monthly reset). Generating the triage report from already-synced videos is always free. Pro unlocks unlimited syncing. The Pro license is available on Gumroad: https://ibrh96.gumroad.com/l/lljtqy
 
 ## Privacy
 
