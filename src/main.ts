@@ -1,4 +1,4 @@
-import { Notice, Plugin, TFile } from "obsidian";
+import { Modal, Notice, Plugin, TFile } from "obsidian";
 import {
 	DEFAULT_SETTINGS,
 	WatchLaterSettingTab,
@@ -7,7 +7,7 @@ import {
 import { LLMAdapter } from "./llm";
 import { VideoCollector } from "./collector";
 import { SynthesisEngine } from "./synthesizer";
-import { verifyLicense } from "./license";
+import { verifyLicense, GUMROAD_URL } from "./license";
 import type { SynthesisCache, VideoRecord } from "./types";
 
 const REPORT_PATH = "Watch Later Triage.md";
@@ -36,6 +36,8 @@ export default class WatchLaterSynthesizerPlugin extends Plugin {
 	llm!: LLMAdapter;
 	collector!: VideoCollector;
 	engine!: SynthesisEngine;
+
+	private isSyncInProgress = false;
 
 	override async onload(): Promise<void> {
 		console.log("Watch Later Synthesizer loaded.");
@@ -104,16 +106,34 @@ export default class WatchLaterSynthesizerPlugin extends Plugin {
 	 * triage, persist the cache. All vault and network I/O is owned here (the
 	 * collector reads notes + oEmbed; the engine reaches the LLM only through the
 	 * injected adapter) — the engine never touches files or settings.
+	 *
+	 * Counter strategy: reserve-then-refund. The free-tier count is incremented
+	 * and persisted BEFORE the LLM await so a crash or force-quit cannot let the
+	 * user get an extra free run. If the triage throws, the catch block refunds
+	 * the increment. isSyncInProgress prevents a second concurrent invocation
+	 * from double-counting.
 	 */
 	private async runSync(): Promise<void> {
-		// Pro gate. Lifetime free tier: 3 successful runs, no monthly reset.
+		// Concurrency guard — one sync at a time.
+		if (this.isSyncInProgress) {
+			new Notice("A sync is already running.");
+			return;
+		}
+
+		// Pro gate. Lifetime free tier: 3 total syncs, no monthly reset.
 		// Pro users are never counted or blocked. Bail before any LLM call.
 		const isPro = verifyLicense(this.settings.proLicenseKey).valid;
 		if (!isPro && this.settings.freeUsage.count >= 3) {
-			new Notice(
-				"Free limit reached: 3 total runs. Upgrade to Pro for unlimited."
-			);
+			new ProUpgradeModal(this.app).open();
 			return;
+		}
+
+		// Reserve the free-tier slot before any await. Persisted to disk so a
+		// crash cannot give the user an extra free run.
+		this.isSyncInProgress = true;
+		if (!isPro) {
+			this.settings.freeUsage.count += 1;
+			await this.persist();
 		}
 
 		try {
@@ -124,13 +144,6 @@ export default class WatchLaterSynthesizerPlugin extends Plugin {
 			this.cache.lastSynced = today;
 			await this.persist();
 
-			// Count the use only after a fully successful run. One run = one use,
-			// regardless of how many videos it touched.
-			if (!isPro) {
-				this.settings.freeUsage.count += 1;
-				await this.persist();
-			}
-
 			const watch = result.verdicts.filter(
 				(v) => v.verdict === "watch"
 			).length;
@@ -140,8 +153,16 @@ export default class WatchLaterSynthesizerPlugin extends Plugin {
 					`(${stats.computed} new, ${stats.reused} cached, ${stats.failed} failed).`
 			);
 		} catch (error) {
+			// Refund the reserved slot so a failed run does not count against the
+			// free tier.
+			if (!isPro) {
+				this.settings.freeUsage.count -= 1;
+				await this.persist();
+			}
 			console.error("Watch Later Synthesizer: triage failed", error);
 			new Notice("Triage failed. See console for details.");
+		} finally {
+			this.isSyncInProgress = false;
 		}
 	}
 
@@ -314,5 +335,36 @@ export default class WatchLaterSynthesizerPlugin extends Plugin {
 		const month = String(now.getMonth() + 1).padStart(2, "0");
 		const day = String(now.getDate()).padStart(2, "0");
 		return `${year}-${month}-${day}`;
+	}
+}
+
+class ProUpgradeModal extends Modal {
+	override onOpen(): void {
+		const { contentEl } = this;
+
+		contentEl.createEl("h2", { text: "Free limit reached" });
+
+		contentEl.createEl("p", {
+			text: "You've used all 3 free syncs. Your existing triage report is still available — use \"Generate triage report\" to view it anytime. New syncs require a Pro license.",
+		});
+
+		const buttonRow = contentEl.createDiv({ cls: "modal-button-container" });
+
+		const getProBtn = buttonRow.createEl("button", {
+			text: "Get Pro license",
+			cls: "mod-cta",
+		});
+		getProBtn.addEventListener("click", () => {
+			window.open(GUMROAD_URL, "_blank");
+		});
+
+		const gotItBtn = buttonRow.createEl("button", { text: "Got it" });
+		gotItBtn.addEventListener("click", () => {
+			this.close();
+		});
+	}
+
+	override onClose(): void {
+		this.contentEl.empty();
 	}
 }

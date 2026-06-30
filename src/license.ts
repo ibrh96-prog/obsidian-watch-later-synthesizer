@@ -6,6 +6,8 @@ import nacl from "tweetnacl";
 //   s = base64 of the Ed25519 detached signature over the payload bytes
 // Verification is fully offline against the embedded public key.
 
+export const GUMROAD_URL = "https://ibrh96.gumroad.com/l/lljtqy";
+
 const PUBLIC_KEY_B64 = "fgnEQ2v3NHUO7XWLk+2Roko28w6Si+Dbi/PuCnq7s1Y=";
 const PRODUCT_ID = "watch-later-synthesizer";
 
